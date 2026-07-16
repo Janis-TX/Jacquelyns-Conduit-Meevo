@@ -1,0 +1,24 @@
+# Render blueprint. Paid Starter = always-on (no free-tier sleep / cold starts).
+services:
+  - type: web
+    name: meevo-mcp
+    runtime: python
+    plan: starter            # always-on; use "free" only for throwaway tests
+    buildCommand: pip install -r requirements.txt
+    startCommand: python meevo_mcp_server.py
+    healthCheckPath: /health
+    envVars:
+      - key: MEEVO_APP_ID
+        sync: false          # set in dashboard; never in repo
+      - key: MEEVO_APP_SECRET
+        sync: false
+      - key: MEEVO_AUTH_URL
+        value: https://marketplace.meevo.com/oauth2/token
+      - key: MEEVO_BASE_URL
+        value: https://na2pub.meevo.com
+      - key: MEEVO_TENANT_ID
+        value: "502388"
+      - key: MEEVO_LOCATION_ID
+        value: "503369"      # Jacquelyns Spa (an identifier, not a secret)
+      - key: PORT
+        value: "10000"
