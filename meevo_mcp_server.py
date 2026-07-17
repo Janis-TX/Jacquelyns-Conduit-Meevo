@@ -214,7 +214,7 @@ mcp = FastMCP("Meevo", host="0.0.0.0", stateless_http=True)
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v27")
+    return PlainTextResponse("OK v28")
 
 
 # ======================= READ-ONLY TOOLS ===================================
@@ -370,20 +370,71 @@ def search_clients(last_name: str = "", first_name: str = "", phone: str = "", e
             "clients": [_shape_client(c) for c in matches[:5]]}
 
 
+def _appt_status(a):
+    """This endpoint reports status as booleans, not a string — derive a readable one."""
+    if a.get("IsCancelled") or a.get("isCancelled"):
+        return "Cancelled"
+    if a.get("IsCheckedOut") or a.get("isCheckedOut"):
+        return "Completed"
+    if a.get("IsCheckedIn") or a.get("isCheckedIn"):
+        return "Checked In"
+    if a.get("IsNoShow") or a.get("isNoShow"):
+        return "No Show"
+    return "Booked"
+
+
+# id->name maps for services/employees (cached ~10 min; Meevo recommends caching these)
+_idmaps = {"s": None, "e": None, "t": 0.0}
+
+
+def _id_name_maps():
+    if _idmaps["s"] is not None and time.time() - _idmaps["t"] < 600:
+        return _idmaps["s"], _idmaps["e"]
+    smap, emap = {}, {}
+    try:
+        for s in (list_services().get("services") or []):
+            if s.get("id"):
+                smap[s["id"]] = s.get("name", "")
+    except Exception:
+        pass
+    try:
+        for e in (list_staff().get("staff") or []):
+            if e.get("id"):
+                emap[e["id"]] = e.get("name", "")
+    except Exception:
+        pass
+    _idmaps.update({"s": smap, "e": emap, "t": time.time()})
+    return smap, emap
+
+
 def _parse_client_services(data):
     out = []
     for svc in _items(data):
         out.append({
-            "appointment_id": _str(_get(svc, "appointmentId", "AppointmentId")),
-            "appointment_service_id": _str(_get(svc, "appointmentServiceId", "AppointmentServiceId", "id", "Id")),
-            "service_name": _str(_get(svc, "serviceName", "ServiceName", "serviceDisplayName")),
-            "employee_name": _str(_get(svc, "employeeName", "EmployeeName", "employeeDisplayName")),
-            "start_time": _str(_get(svc, "startTime", "StartTime", "startDateTime", "StartDateTime")),
-            "status": _str(_get(svc, "status", "Status", "appointmentStatus")),
-            "concurrency_check_digits": _str(_get(svc, "concurrencyCheckDigits", "ConcurrencyCheckDigits",
-                                                   "rowVersion", "RowVersion")),
+            "appointment_id": _str(_get(svc, "AppointmentId", "appointmentId")),
+            "appointment_service_id": _str(_get(svc, "AppointmentServiceId", "appointmentServiceId", "id", "Id")),
+            "service_id": _str(_get(svc, "ServiceId", "serviceId")),
+            "service_name": "",   # filled by _enrich_names (endpoint returns only ServiceId)
+            "employee_id": _str(_get(svc, "EmployeeId", "employeeId")),
+            "employee_name": "",  # filled by _enrich_names
+            "resource_id": _str(_get(svc, "ResourceId", "resourceId")),
+            "start_time": _str(_get(svc, "StartTime", "startTime", "startDateTime", "StartDateTime")),
+            "status": _appt_status(svc),
+            "concurrency_check_digits": _str(_get(svc, "ConcurrencyCheckDigits", "concurrencyCheckDigits",
+                                                   "RowVersion", "rowVersion")),
         })
     return out
+
+
+def _enrich_names(appts):
+    """Fill service_name/employee_name from their IDs (cached lookups)."""
+    if not appts:
+        return appts
+    smap, emap = _id_name_maps()
+    for a in appts:
+        a["service_name"] = smap.get(a.get("service_id"), a.get("service_name", ""))
+        a["employee_name"] = emap.get(a.get("employee_id"), a.get("employee_name", ""))
+    return appts
 
 
 def _appts_api_fallback(client_id, sd, ed):
@@ -454,6 +505,7 @@ def get_client_appointments(client_id: str, start_date: str = "", end_date: str 
                                                   {"startDate": sd, "endDate": ed}))
         tried["book/client/{id}/services"] = f"ok ({len(parsed)})" if parsed else "empty"
         if parsed:
+            _enrich_names(parsed)
             return {"appointments": parsed, "count": len(parsed), "date_range": f"{sd} to {ed}",
                     "source": "book/client/services"}
     except requests.HTTPError as e:
@@ -462,6 +514,7 @@ def get_client_appointments(client_id: str, start_date: str = "", end_date: str 
     parsed, api_tried = _appts_api_fallback(client_id, sd, ed)
     tried.update(api_tried)
     if parsed:
+        _enrich_names(parsed)
         return {"appointments": parsed, "count": len(parsed), "date_range": f"{sd} to {ed}",
                 "source": "api-fallback"}
     # LAST RESORT: SFTP/DDS feed
