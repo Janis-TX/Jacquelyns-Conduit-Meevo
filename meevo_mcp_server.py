@@ -214,7 +214,7 @@ mcp = FastMCP("Meevo", host="0.0.0.0", stateless_http=True)
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v29")
+    return PlainTextResponse("OK v30")
 
 
 # ======================= READ-ONLY TOOLS ===================================
@@ -230,10 +230,9 @@ def debug_api(path: str) -> dict:
                 "body": e.response.text[:500] if e.response else ""}
 
 
-@mcp.tool()
 def lookup_enum(enum_name: str) -> dict:
-    """Get the allowed integer values for a Meevo enum (e.g. 'ScanDateType',
-    'ScanTimeType'). Use this to verify the scan enum values used by check_availability."""
+    """Internal helper only - NOT exposed as an agent tool. (It was causing the agent to loop
+    trying to resolve scan enums instead of just calling check_availability.)"""
     try:
         return {"enum": enum_name, "values": meevo_get(f"/publicapi/v1/system/enum/{enum_name}")}
     except requests.HTTPError as e:
@@ -558,11 +557,12 @@ def _compact_openings(openings, per_day=4, cap=15):
 
 
 def check_availability(service_id: str, check_date: str = "", days_ahead: int = 7,
-                       employee_id: str = "", scan_date_type: int = 2094,
-                       scan_time_type: int = 2095) -> dict:
-    """Check available appointment slots. check_date YYYY-MM-DD (defaults today).
-    If openings come back empty, verify scan_date_type/scan_time_type with
-    lookup_enum('ScanDateType')/lookup_enum('ScanTimeType') and pass the right values."""
+                       employee_id: str = "") -> dict:
+    """Check open appointment slots for a service. This is THE tool for availability/openings -
+    call it directly, no setup needed. service_id comes from list_services. check_date is
+    YYYY-MM-DD (defaults today). Returns up to ~15 openings spread across the days."""
+    scan_date_type = 2094   # working defaults for this location (do not require the agent to set)
+    scan_time_type = 2095
     start = check_date or _today().isoformat()
     end = (date.fromisoformat(start) + timedelta(days=days_ahead)).isoformat()
     body = _scan_body(service_id, start, end, employee_id, scan_date_type, scan_time_type)
