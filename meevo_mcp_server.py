@@ -214,7 +214,7 @@ mcp = FastMCP("Meevo", host="0.0.0.0", stateless_http=True)
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v28")
+    return PlainTextResponse("OK v29")
 
 
 # ======================= READ-ONLY TOOLS ===================================
@@ -541,6 +541,22 @@ def _scan_body(service_id, start, end, employee_id, scan_date_type, scan_time_ty
 
 
 @mcp.tool()
+def _compact_openings(openings, per_day=4, cap=15):
+    """Return a small, day-spread subset so the tool payload stays light for the agent.
+    A huge openings list (100-200 slots) can stall the agent; a handful per day is plenty
+    to answer 'what's available' and still carries booking fields for the chosen slot."""
+    by_day, out = {}, []
+    for o in openings:
+        d = o.get("date", "")
+        if by_day.get(d, 0) >= per_day:
+            continue
+        by_day[d] = by_day.get(d, 0) + 1
+        out.append(o)
+        if len(out) >= cap:
+            break
+    return out
+
+
 def check_availability(service_id: str, check_date: str = "", days_ahead: int = 7,
                        employee_id: str = "", scan_date_type: int = 2094,
                        scan_time_type: int = 2095) -> dict:
@@ -575,7 +591,7 @@ def check_availability(service_id: str, check_date: str = "", days_ahead: int = 
         openings = _parse_groups(r.json())
         if openings:
             return {"service_id": service_id, "start": start, "end": end,
-                    "openings": openings[:200], "total": len(openings), "source": "ob"}
+                    "openings": _compact_openings(openings), "total": len(openings), "source": "ob"}
         ob_note = "ob scan returned 0 openings"
     except requests.HTTPError as e:
         ob_note = f"ob scan error: {e.response.text[:200] if e.response is not None else e}"
