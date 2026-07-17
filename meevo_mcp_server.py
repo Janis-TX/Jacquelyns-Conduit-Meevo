@@ -32,7 +32,8 @@ import re
 import time
 import uuid
 import requests
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from mcp.server.fastmcp import FastMCP
 
 # ---- config (NO secrets hardcoded; all from env) --------------------------
@@ -57,6 +58,15 @@ def _ob_base():
 
 
 OB_BASE = _ob_base()
+
+# Spa's local timezone — dates ("today", availability windows) are computed here,
+# NOT in the server's UTC, so "today/tomorrow" never shifts by one near midnight.
+SPA_TZ = ZoneInfo(os.environ.get("MEEVO_TZ", "America/Chicago"))
+
+
+def _today():
+    return datetime.now(SPA_TZ).date()
+
 
 _token = None
 _token_expiry = 0.0
@@ -204,7 +214,7 @@ mcp = FastMCP("Meevo", host="0.0.0.0", stateless_http=True)
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v26")
+    return PlainTextResponse("OK v27")
 
 
 # ======================= READ-ONLY TOOLS ===================================
@@ -435,8 +445,8 @@ def get_client_appointments(client_id: str, start_date: str = "", end_date: str 
     """Get a client's upcoming appointments. Returns appointment_service_id and
     concurrency_check_digits needed for cancel/reschedule. Dates: YYYY-MM-DD
     (defaults today .. +90 days)."""
-    sd = start_date or date.today().isoformat()
-    ed = end_date or (date.today() + timedelta(days=90)).isoformat()
+    sd = start_date or _today().isoformat()
+    ed = end_date or (_today() + timedelta(days=90)).isoformat()
     tried = {}
     # PRIMARY (verified): a client's booked services
     try:
@@ -484,7 +494,7 @@ def check_availability(service_id: str, check_date: str = "", days_ahead: int = 
     """Check available appointment slots. check_date YYYY-MM-DD (defaults today).
     If openings come back empty, verify scan_date_type/scan_time_type with
     lookup_enum('ScanDateType')/lookup_enum('ScanTimeType') and pass the right values."""
-    start = check_date or date.today().isoformat()
+    start = check_date or _today().isoformat()
     end = (date.fromisoformat(start) + timedelta(days=days_ahead)).isoformat()
     body = _scan_body(service_id, start, end, employee_id, scan_date_type, scan_time_type)
 
@@ -615,8 +625,8 @@ def list_resources(service_id: str = "") -> dict:
     notes = {}
     if service_id:
         try:
-            start = date.today().isoformat()
-            end = (date.today() + timedelta(days=7)).isoformat()
+            start = _today().isoformat()
+            end = (_today() + timedelta(days=7)).isoformat()
             body = _scan_body(service_id, start, end, "", 2094, 2095)
             r = requests.post(f"{OB_BASE}/scanforopenings", json=body, headers=_ob_headers(), timeout=20)
             r.raise_for_status()
