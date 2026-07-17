@@ -204,7 +204,7 @@ mcp = FastMCP("Meevo", host="0.0.0.0", stateless_http=True)
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v25")
+    return PlainTextResponse("OK v26")
 
 
 # ======================= READ-ONLY TOOLS ===================================
@@ -231,22 +231,27 @@ def lookup_enum(enum_name: str) -> dict:
 
 
 def _client_candidates(phone="", email="", last_name=""):
-    """Prefer documented server-side lookup; fall back to paging only if needed."""
-    # PRIMARY: POST /publicapi/v1/clients/lookup  (server-side filter)
-    body = {}
+    """Prefer documented server-side lookup, fall back to paging only if needed.
+    Per Meevo docs, POST /publicapi/v1/clients/lookup takes a LIST of ONE attribute type
+    (ClientIds OR EmailAddresses OR PhoneNumbers) — only one type at a time. We try a few
+    likely body encodings and use the first that returns matches (name-only search can't use
+    this endpoint, so it falls through to paging)."""
+    bodies = []
     if phone:
-        body["PhoneNumber"] = phone
-    if email:
-        body["EmailAddress"] = email
-    if last_name:
-        body["LastName"] = last_name
-    try:
-        data = meevo_post("/publicapi/v1/clients/lookup", body)
-        items = _items(data)
-        if items:
-            return items, "clients/lookup"
-    except requests.HTTPError:
-        pass
+        d = re.sub(r'\D', '', phone)
+        d10 = d.lstrip('1')
+        for v in dict.fromkeys([d10, d, phone]):   # ordered, de-duped
+            bodies += [[v], {"PhoneNumbers": [v]}, {"phoneNumbers": [v]}]
+    elif email:
+        e = email.strip()
+        bodies += [[e], {"EmailAddresses": [e]}, {"emailAddresses": [e]}]
+    for b in bodies:
+        try:
+            items = _items(meevo_post("/publicapi/v1/clients/lookup", b))
+            if items:
+                return items, "clients/lookup"
+        except requests.HTTPError:
+            continue
     # FALLBACK: page GET /publicapi/v1/clients (v24 behavior; capped to protect API budget)
     all_clients = []
     page_size = None
