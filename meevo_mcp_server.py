@@ -214,7 +214,7 @@ mcp = FastMCP("Meevo", host="0.0.0.0", stateless_http=True)
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v30")
+    return PlainTextResponse("OK v31")
 
 
 # ======================= READ-ONLY TOOLS ===================================
@@ -539,7 +539,6 @@ def _scan_body(service_id, start, end, employee_id, scan_date_type, scan_time_ty
     }
 
 
-@mcp.tool()
 def _compact_openings(openings, per_day=4, cap=15):
     """Return a small, day-spread subset so the tool payload stays light for the agent.
     A huge openings list (100-200 slots) can stall the agent; a handful per day is plenty
@@ -556,6 +555,7 @@ def _compact_openings(openings, per_day=4, cap=15):
     return out
 
 
+@mcp.tool()
 def check_availability(service_id: str, check_date: str = "", days_ahead: int = 7,
                        employee_id: str = "") -> dict:
     """Check open appointment slots for a service. This is THE tool for availability/openings -
