@@ -214,7 +214,7 @@ mcp = FastMCP("Meevo", host="0.0.0.0", stateless_http=True)
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v31")
+    return PlainTextResponse("OK v32")
 
 
 # ======================= READ-ONLY TOOLS ===================================
@@ -539,12 +539,14 @@ def _scan_body(service_id, start, end, employee_id, scan_date_type, scan_time_ty
     }
 
 
-def _compact_openings(openings, per_day=4, cap=15):
-    """Return a small, day-spread subset so the tool payload stays light for the agent.
-    A huge openings list (100-200 slots) can stall the agent; a handful per day is plenty
-    to answer 'what's available' and still carries booking fields for the chosen slot."""
+def _compact_openings(openings, per_day=3, cap=6):
+    """Return the SOONEST openings, earliest first, so we fill today/near-term gaps first
+    and keep the agent's payload light. Sorts by date+time, then takes a few per day across
+    the soonest day(s). The full count is returned separately as 'total' so the agent knows
+    more exist. Each opening still carries the booking fields for the chosen slot."""
+    ordered = sorted(openings, key=lambda o: (o.get("date", ""), o.get("start_time", "")))
     by_day, out = {}, []
-    for o in openings:
+    for o in ordered:
         d = o.get("date", "")
         if by_day.get(d, 0) >= per_day:
             continue
@@ -559,8 +561,10 @@ def _compact_openings(openings, per_day=4, cap=15):
 def check_availability(service_id: str, check_date: str = "", days_ahead: int = 7,
                        employee_id: str = "") -> dict:
     """Check open appointment slots for a service. This is THE tool for availability/openings -
-    call it directly, no setup needed. service_id comes from list_services. check_date is
-    YYYY-MM-DD (defaults today). Returns up to ~15 openings spread across the days."""
+    call it once, directly; no setup needed. service_id comes from list_services. check_date is
+    YYYY-MM-DD (defaults today). Returns the SOONEST openings already sorted earliest-first
+    (a few per day) so you can offer the nearest times; 'total' is the full count if more exist.
+    One call covers the whole window - do NOT call this repeatedly day-by-day."""
     scan_date_type = 2094   # working defaults for this location (do not require the agent to set)
     scan_time_type = 2095
     start = check_date or _today().isoformat()
