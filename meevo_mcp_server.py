@@ -214,7 +214,7 @@ mcp = FastMCP("Meevo", host="0.0.0.0", stateless_http=True)
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v32")
+    return PlainTextResponse("OK v33")
 
 
 # ======================= READ-ONLY TOOLS ===================================
@@ -729,11 +729,16 @@ def list_resources(service_id: str = "") -> dict:
 @mcp.tool()
 def book_appointment(client_id: str, service_id: str, start_datetime: str, employee_id: str = "",
                      resource_id: str = "", concurrency_check_digits: str = "", notes: str = "",
+                     provider_requested: bool = False,
                      confirm: bool = False, confirmation_token: str = "", idempotency_key: str = "") -> dict:
     """Book a new appointment. start_datetime: YYYY-MM-DDTHH:MM:SS. Pass resource_id and
-    concurrency_check_digits from check_availability. WRITE - requires confirmation."""
+    concurrency_check_digits from check_availability. Set provider_requested=true ONLY when the
+    client specifically asked for this employee; leave it false when they had no preference (this
+    keeps the booking flexible/movable and is recorded in Meevo's requested reporting).
+    WRITE - requires confirmation."""
     params = {"client_id": client_id, "service_id": service_id, "start_datetime": start_datetime,
-              "employee_id": employee_id, "resource_id": resource_id}
+              "employee_id": employee_id, "resource_id": resource_id,
+              "provider_requested": provider_requested}
     if not confirm:
         return _begin_write("book_appointment", params,
                             f"Book service {service_id} for client {client_id} at {start_datetime} "
@@ -745,7 +750,7 @@ def book_appointment(client_id: str, service_id: str, start_datetime: str, emplo
         return {"success": False, "error": err}
     body = {"ClientId": client_id, "ServiceId": service_id, "StartTime": start_datetime,
             "SendConfirmation": True, "SendClientNotification": True, "NotifyClient": True,
-            "BookingSource": 2}
+            "BookingSource": 2, "IsEmployeeRequestedByClient": bool(provider_requested)}
     if employee_id:
         body["EmployeeId"] = employee_id
     if resource_id:
