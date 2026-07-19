@@ -214,7 +214,56 @@ mcp = FastMCP("Meevo", host="0.0.0.0", stateless_http=True)
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v34")
+    return PlainTextResponse("OK v35")
+
+
+@mcp.custom_route("/diag", methods=["GET"])
+async def diag(request):
+    """TEMPORARY discovery diagnostic (gap-filling optimizer feasibility). Fails closed: does
+    nothing unless the DIAG_TOKEN env var is set AND matches ?token=. Returns ONLY scan openings
+    (times/resources) - no client PII, no credentials. Remove/disable after the discovery test."""
+    from starlette.responses import JSONResponse, PlainTextResponse
+    import os as _os
+    tok = _os.environ.get("DIAG_TOKEN", "")
+    if not tok or request.query_params.get("token", "") != tok:
+        return PlainTextResponse("forbidden", status_code=403)
+    try:
+        if request.query_params.get("mode", "") == "services":
+            all_s = []
+            for pg in range(1, 20):
+                batch = _items(meevo_get("/publicapi/v1/services", {"pageNumber": pg}))
+                if not batch:
+                    break
+                all_s.extend(batch)
+                if len(batch) < 20:
+                    break
+            out = [{"id": _str(s.get("id") or s.get("serviceId")),
+                    "name": _str(s.get("displayName") or s.get("serviceDisplayName") or s.get("name")),
+                    "duration": _str(s.get("duration") or s.get("durationMinutes"))} for s in all_s]
+            return JSONResponse({"count": len(out), "services": out})
+        start = request.query_params.get("date") or _today().isoformat()
+        end = (date.fromisoformat(start) + timedelta(days=int(request.query_params.get("days", "0")))).isoformat()
+        emp = request.query_params.get("employee", "")
+        results = []
+        for sid in [x for x in request.query_params.get("scan", "").split(",") if x]:
+            body = _scan_body(sid, start, end, emp, 2094, 2095)
+            r = requests.post(f"{OB_BASE}/scanforopenings", json=body, headers=_ob_headers(), timeout=25)
+            ops = []
+            if r.ok:
+                for g in (r.json() or []):
+                    for o in (g.get("serviceOpenings") or []):
+                        ops.append({"d": (o.get("date") or "")[:10],
+                                    "s": (o.get("startTime") or "")[11:16],
+                                    "e": (o.get("endTime") or "")[11:16],
+                                    "emp": o.get("employeeDisplayName") or o.get("employeeName") or "",
+                                    "res": o.get("resourceName") or o.get("ResourceName") or ""})
+            results.append({"service_id": sid,
+                            "req": {"start": start, "end": end, "employee": emp or "any",
+                                    "maxOpeningsPerDay": body.get("maxOpeningsPerDay")},
+                            "status": r.status_code, "total": len(ops), "openings": ops})
+        return JSONResponse({"date": start, "results": results})
+    except Exception as ex:
+        return JSONResponse({"error": str(ex)}, status_code=500)
 
 
 # ======================= READ-ONLY TOOLS ===================================
