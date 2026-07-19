@@ -214,7 +214,7 @@ mcp = FastMCP("Meevo", host="0.0.0.0", stateless_http=True)
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v35")
+    return PlainTextResponse("OK v36")
 
 
 @mcp.custom_route("/diag", methods=["GET"])
@@ -241,6 +241,11 @@ async def diag(request):
                     "name": _str(s.get("displayName") or s.get("serviceDisplayName") or s.get("name")),
                     "duration": _str(s.get("duration") or s.get("durationMinutes"))} for s in all_s]
             return JSONResponse({"count": len(out), "services": out})
+        if request.query_params.get("mode", "") == "staff":
+            staff = _items(meevo_get("/publicapi/v1/employees"))
+            out = [{"id": _str(e.get("id") or e.get("employeeId")),
+                    "name": (_str(e.get("firstName")) + " " + _str(e.get("lastName"))).strip()} for e in staff]
+            return JSONResponse({"count": len(out), "staff": out})
         start = request.query_params.get("date") or _today().isoformat()
         end = (date.fromisoformat(start) + timedelta(days=int(request.query_params.get("days", "0")))).isoformat()
         emp = request.query_params.get("employee", "")
@@ -256,6 +261,7 @@ async def diag(request):
                                     "s": (o.get("startTime") or "")[11:16],
                                     "e": (o.get("endTime") or "")[11:16],
                                     "emp": o.get("employeeDisplayName") or o.get("employeeName") or "",
+                                    "emp_id": o.get("employeeId") or o.get("EmployeeId") or "",
                                     "res": o.get("resourceName") or o.get("ResourceName") or ""})
             results.append({"service_id": sid,
                             "req": {"start": start, "end": end, "employee": emp or "any",
