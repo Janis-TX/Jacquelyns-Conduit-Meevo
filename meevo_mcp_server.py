@@ -214,7 +214,7 @@ mcp = FastMCP("Meevo", host="0.0.0.0", stateless_http=True)
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v33")
+    return PlainTextResponse("OK v34")
 
 
 # ======================= READ-ONLY TOOLS ===================================
@@ -769,6 +769,45 @@ def book_appointment(client_id: str, service_id: str, start_datetime: str, emplo
                "appointment_id": _get(result, "AppointmentId", "appointmentId"), "raw": result}
     except requests.HTTPError as e:
         out = {"success": False, "error": str(e), "response_body": e.response.text if e.response is not None else ""}
+    if idempotency_key and out.get("success"):
+        _idem[idempotency_key] = out
+    _pending.pop(confirmation_token, None)
+    return out
+
+
+@mcp.tool()
+def create_client(first_name: str, last_name: str, phone: str = "", email: str = "",
+                  confirm: bool = False, confirmation_token: str = "", idempotency_key: str = "") -> dict:
+    """Create a NEW Meevo client profile - use this for a brand-new customer who is NOT already in
+    Meevo (lookup_client found no match). Use the phone number from the conversation. Returns the
+    new client_id, which you then pass to book_appointment. WRITE - requires confirmation."""
+    params = {"first_name": first_name, "last_name": last_name, "phone": phone, "email": email}
+    if not confirm:
+        return _begin_write("create_client", params,
+                            f"Create new Meevo client '{first_name} {last_name}' "
+                            f"(phone {phone or 'none'}, email {email or 'none'}).")
+    if idempotency_key and idempotency_key in _idem:
+        return _idem[idempotency_key]
+    err = _confirm_ok("create_client", params, confirmation_token)
+    if err:
+        return {"success": False, "error": err}
+    body = {"FirstName": first_name, "LastName": last_name}
+    if email:
+        body["EmailAddress"] = email
+    if phone:
+        body["PhoneNumbers"] = [{"number": _phone_digits(phone), "countryCode": "1",
+                                 "isPrimary": True}]
+    try:
+        result = meevo_post("/publicapi/v1/client", body)
+        cid = ""
+        if isinstance(result, dict):
+            cid = _get(result, "ClientId", "clientId", "Id", "id")
+        elif isinstance(result, str):
+            cid = result.strip().strip('"')
+        out = {"success": True, "client_id": cid, "raw": result}
+    except requests.HTTPError as e:
+        out = {"success": False, "error": str(e),
+               "response_body": e.response.text[:500] if e.response is not None else ""}
     if idempotency_key and out.get("success"):
         _idem[idempotency_key] = out
     _pending.pop(confirmation_token, None)
