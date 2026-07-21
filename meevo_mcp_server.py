@@ -50,6 +50,31 @@ SFTP_KEY_B64 = os.environ.get("MEEVO_SFTP_KEY_B64", "")
 SFTP_PATH = os.environ.get("MEEVO_SFTP_PATH", "/pmvo2-cdcsftp-storage01/MeevoTemp/SFTP/JacquelynsSpa")
 
 
+# ---- timing instrumentation (SAFE: logs endpoint PATH + duration + status only; never bodies, PII, creds, tokens) ----
+import time as _t, json as _j
+from urllib.parse import urlsplit as _usp
+
+def _now_ms():
+    return _t.perf_counter() * 1000.0
+
+def _meevo_timed(method, url, **kw):
+    """Time a Meevo HTTP call and emit one structured log line. Logs only the URL path (no query
+    string, no body), the duration in ms, and the HTTP status."""
+    ep = _usp(url).path
+    t0 = _now_ms()
+    status = None
+    try:
+        r = getattr(requests, method)(url, **kw)
+        status = r.status_code
+        return r
+    finally:
+        try:
+            print(_j.dumps({"evt": "meevo", "ep": ep, "ms": round(_now_ms() - t0, 1),
+                            "status": status}), flush=True)
+        except Exception:
+            pass
+
+
 def _ob_base():
     host = BASE_URL.rstrip("/")
     host = re.sub(r'pub\.meevo\.com', '.meevo.com', host)
@@ -133,20 +158,20 @@ def meevo_get(path, params=None):
     base = {"TenantId": TENANT_ID, "LocationId": LOCATION_ID}   # was lowercase in v24
     if params:
         base.update(params)
-    r = requests.get(f"{BASE_URL}{path}", params=base, headers=_auth_headers(), timeout=15)
+    r = _meevo_timed("get", f"{BASE_URL}{path}", params=base, headers=_auth_headers(), timeout=15)
     r.raise_for_status()
     return r.json()
 
 
 def meevo_post(path, body, extra_params=None):
-    r = requests.post(f"{BASE_URL}{path}", params=_cap_params(extra_params), json=body,
+    r = _meevo_timed("post", f"{BASE_URL}{path}", params=_cap_params(extra_params), json=body,
                       headers=_auth_headers(), timeout=15)
     r.raise_for_status()
     return r.json() if r.content else {}
 
 
 def meevo_put(path, body, extra_params=None):
-    r = requests.put(f"{BASE_URL}{path}", params=_cap_params(extra_params), json=body,
+    r = _meevo_timed("put", f"{BASE_URL}{path}", params=_cap_params(extra_params), json=body,
                      headers=_auth_headers(), timeout=15)
     r.raise_for_status()
     return r.json() if r.content else {"success": True}
@@ -214,7 +239,7 @@ mcp = FastMCP("Meevo", host="0.0.0.0", stateless_http=True)
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v36")
+    return PlainTextResponse("OK v37")
 
 
 @mcp.custom_route("/diag", methods=["GET"])
@@ -645,7 +670,7 @@ def check_availability(service_id: str, check_date: str = "", days_ahead: int = 
 
     # PRIMARY: OB scanforopenings (rich data incl. resource + concurrency digits)
     try:
-        r = requests.post(f"{OB_BASE}/scanforopenings", json=body, headers=_ob_headers(), timeout=20)
+        r = _meevo_timed("post", f"{OB_BASE}/scanforopenings", json=body, headers=_ob_headers(), timeout=20)
         r.raise_for_status()
         openings = _parse_groups(r.json())
         if openings:
@@ -756,7 +781,7 @@ def list_resources(service_id: str = "") -> dict:
             start = _today().isoformat()
             end = (_today() + timedelta(days=7)).isoformat()
             body = _scan_body(service_id, start, end, "", 2094, 2095)
-            r = requests.post(f"{OB_BASE}/scanforopenings", json=body, headers=_ob_headers(), timeout=20)
+            r = _meevo_timed("post", f"{OB_BASE}/scanforopenings", json=body, headers=_ob_headers(), timeout=20)
             r.raise_for_status()
             for group in (r.json() or []):
                 for o in (group.get("serviceOpenings") or []):
@@ -815,7 +840,7 @@ def book_appointment(client_id: str, service_id: str, start_datetime: str, emplo
     if notes:
         body["Notes"] = notes
     try:
-        r = requests.post(f"{BASE_URL}/publicapi/v1/book/service", params=_cap_params(), json=body,
+        r = _meevo_timed("post", f"{BASE_URL}/publicapi/v1/book/service", params=_cap_params(), json=body,
                           headers=_auth_headers(), timeout=15)
         r.raise_for_status()
         result = r.json() if r.content else {"success": True}
