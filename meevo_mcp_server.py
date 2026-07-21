@@ -155,6 +155,14 @@ def _cap_params(extra=None):
 
 
 def meevo_get(path, params=None):
+    # Normalize path so a caller-supplied path WITHOUT a leading "/" (e.g. debug_api given
+    # "services?offset=70") cannot fuse onto the host and produce an unresolvable URL like
+    # "na2pub.meevo.comservices". Also tolerate a full URL that already includes BASE_URL.
+    path = (path or "").strip()
+    if path.startswith(BASE_URL):
+        path = path[len(BASE_URL):]
+    if not path.startswith("/"):
+        path = "/" + path
     base = {"TenantId": TENANT_ID, "LocationId": LOCATION_ID}   # was lowercase in v24
     if params:
         base.update(params)
@@ -320,15 +328,10 @@ def suggest_best_slot_impl(service_id, date_str="", days=0, employee="", window=
         out["handoff"] = "offer_front_desk"
     return out
 
-@mcp.tool()
-def suggest_best_slot(service_id: str, date: str = "", days_ahead: int = 0,
-                      employee_id: str = "", specific_time: str = "") -> dict:
-    """Recommend the single best appointment time for a service (gap-filling optimizer).
-    RECOMMENDATION ONLY — this does NOT book anything. Returns one recommended time plus up to two
-    internal alternatives with reason codes, a completeness flag, and a safe handoff status.
-    service_id comes from list_services; date is YYYY-MM-DD; employee_id optional (a specific
-    requested provider); specific_time optional HH:MM if the client asked for an exact time."""
-    return suggest_best_slot_impl(service_id, date, days_ahead, employee_id, None, specific_time or None)
+
+# NOTE: suggest_best_slot is intentionally NOT exposed as an @mcp.tool() in production yet
+# (kept dormant/untested pending intentional rollout). suggest_best_slot_impl stays available
+# only via the token-gated /suggest route below. This keeps the live toolset at 14.
 
 
 @mcp.custom_route("/suggest", methods=["GET"])
@@ -353,7 +356,7 @@ async def suggest_route(request):
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v39")
+    return PlainTextResponse("OK v40")
 
 
 @mcp.custom_route("/diag", methods=["GET"])
@@ -422,6 +425,10 @@ def debug_api(path: str) -> dict:
     except requests.HTTPError as e:
         return {"error": str(e), "status": e.response.status_code if e.response else None,
                 "body": e.response.text[:500] if e.response else ""}
+    except Exception as e:
+        # Return a clean error (e.g. connection/DNS failures) instead of raising, so a bad
+        # free-form path can never trigger the agent's retry-thrash / load_capability escalation.
+        return {"error": str(e), "path": path}
 
 
 def lookup_enum(enum_name: str) -> dict:
