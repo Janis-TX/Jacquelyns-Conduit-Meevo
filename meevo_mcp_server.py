@@ -236,10 +236,113 @@ def _confirm_ok(action, params, token):
 mcp = FastMCP("Meevo", host="0.0.0.0", stateless_http=True)
 
 
+# ===================== CONSOLIDATED AVAILABILITY (DORMANT — NOT an MCP tool; Hazel cannot call it) =====================
+_META = {"services": None, "staff": None, "loaded_at": 0.0}
+_META_TTL = 6 * 3600  # refresh stable metadata every 6h (never caches availability)
+# resource-category -> (reference service id, ref duration) for conservative boundary mapping
+_REF_SVC = {
+    "Spray Tan":   ("57540c68-dfdb-4a3f-ac17-b45900ee39c3", 15),  # booth: exact (grid) boundaries
+    "Facial Room": ("8acbf2f0-dbaa-4277-a476-b45900ee39c3", 25),  # Express Facial: ~0-10min inward residual
+}
+
+def _load_meta(force=False):
+    """Cache stable reference data (service id/name, staff GUID/name). Refresh: startup / TTL /
+    miss / forced. Availability is NEVER cached."""
+    now = _t.time()
+    if not force and _META["services"] is not None and (now - _META["loaded_at"]) < _META_TTL:
+        return _META
+    svcs = {}
+    for pg in range(1, 20):
+        batch = _items(meevo_get("/publicapi/v1/services", {"pageNumber": pg}))
+        if not batch:
+            break
+        for s in batch:
+            sid = _str(s.get("id") or s.get("serviceId"))
+            svcs[sid] = _str(s.get("displayName") or s.get("serviceDisplayName") or s.get("name"))
+        if len(batch) < 20:
+            break
+    staff = {}
+    for e in _items(meevo_get("/publicapi/v1/employees")):
+        eid = _str(e.get("id") or e.get("employeeId"))
+        staff[eid] = (_str(e.get("firstName")) + " " + _str(e.get("lastName"))).strip()
+    _META.update({"services": svcs, "staff": staff, "loaded_at": now})
+    return _META
+
+def _scan_raw(service_id, start, end, employee=""):
+    """One OB scan -> ([{emp_id, emp, s, e, res}], status). Duration derived from e-s."""
+    body = _scan_body(service_id, start, end, employee, 2094, 2095)
+    r = _meevo_timed("post", f"{OB_BASE}/scanforopenings", json=body, headers=_ob_headers(), timeout=25)
+    out = []
+    if r.ok:
+        for g in (r.json() or []):
+            for o in (g.get("serviceOpenings") or []):
+                out.append({"emp_id": o.get("employeeId") or "",
+                            "emp": o.get("employeeDisplayName") or o.get("employeeName") or "",
+                            "s": (o.get("startTime") or "")[11:16],
+                            "e": (o.get("endTime") or "")[11:16],
+                            "res": o.get("resourceName") or o.get("ResourceName") or ""})
+    return out, r.status_code
+
+def suggest_best_slot_impl(service_id, date_str="", days=0, employee="", window=None, specific=None):
+    """DORMANT consolidated availability + recommendation. RECOMMENDATION ONLY — never books.
+    One call: resolve service (cache) -> candidate scan -> eligible providers -> per-provider
+    reference scans -> conservative maps -> score (9 locked priorities) -> best + <=2 alternatives
+    + reason codes + completeness + timing + safe handoff status."""
+    import slot_logic as SL
+    t0 = _now_ms()
+    _load_meta()
+    start = date_str or _today().isoformat()
+    end = (date.fromisoformat(start) + timedelta(days=int(days))).isoformat()
+    cand, st = _scan_raw(service_id, start, end, employee)
+    if not cand:
+        return {"status": "no_availability", "completeness": "complete", "recommended": None,
+                "alternatives": [], "handoff": "offer_front_desk", "timing_ms": round(_now_ms() - t0, 1)}
+    def _dmin(o):
+        try:
+            return SL.to_min(o["e"]) - SL.to_min(o["s"])
+        except Exception:
+            return None
+    durs = [d for o in cand if (d := _dmin(o)) is not None]
+    duration = max(set(durs), key=durs.count) if durs else 15   # modal duration from the scan
+    res = next((o["res"] for o in cand if o["res"]), "")
+    emps = sorted({o["emp_id"] for o in cand if o["emp_id"]})
+    candidates_by_emp = {e: sorted({o["s"] for o in cand if o["emp_id"] == e}) for e in emps}
+    ref_id, ref_dur = _REF_SVC.get(res, (service_id, duration))  # fallback: requested svc itself
+    reference_by_emp = {}
+    for e in emps:
+        rr, _ = _scan_raw(ref_id, start, end, e)
+        reference_by_emp[e] = sorted({o["s"] for o in rr})
+    out = SL.suggest(duration, candidates_by_emp, reference_by_emp, ref_dur,
+                     requested_window=window, specific_time=specific)
+    out["timing_ms"] = round(_now_ms() - t0, 1)
+    out["derived"] = {"duration": duration, "resource": res, "ref_dur": ref_dur, "providers": len(emps)}
+    if out.get("status") != "ok" and not out.get("handoff"):
+        out["handoff"] = "offer_front_desk"
+    return out
+
+@mcp.custom_route("/suggest", methods=["GET"])
+async def suggest_route(request):
+    """DORMANT token-gated test route for suggest_best_slot_impl. Fails closed unless SUGGEST_TOKEN
+    is set AND matches ?token=. NOT an MCP tool — Hazel has no access. Recommendation only."""
+    from starlette.responses import JSONResponse, PlainTextResponse
+    import os as _os
+    tok = _os.environ.get("SUGGEST_TOKEN", "")
+    if not tok or request.query_params.get("token", "") != tok:
+        return PlainTextResponse("forbidden", status_code=403)
+    try:
+        q = request.query_params
+        win = (q.get("wstart"), q.get("wend")) if (q.get("wstart") and q.get("wend")) else None
+        res = suggest_best_slot_impl(q.get("service", ""), q.get("date", ""), int(q.get("days", "0")),
+                                     q.get("employee", ""), win, q.get("specific") or None)
+        return JSONResponse(res)
+    except Exception as ex:
+        return JSONResponse({"error": str(ex)}, status_code=500)
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v37")
+    return PlainTextResponse("OK v38")
 
 
 @mcp.custom_route("/diag", methods=["GET"])
