@@ -324,14 +324,42 @@ def suggest_best_slot_impl(service_id, date_str="", days=0, employee="", window=
                      requested_window=window, specific_time=specific)
     out["timing_ms"] = round(_now_ms() - t0, 1)
     out["derived"] = {"duration": duration, "resource": res, "ref_dur": ref_dur, "providers": len(emps)}
-    if out.get("status") != "ok" and not out.get("handoff"):
+    # Hand off only for genuine dead-ends: a non-ok status with NO usable alternatives.
+    # (requested_time_unavailable WITH nearest-time alternatives must NOT be forced to a handoff.)
+    if out.get("status") != "ok" and not out.get("alternatives") and not out.get("handoff"):
         out["handoff"] = "offer_front_desk"
     return out
 
 
-# NOTE: suggest_best_slot is intentionally NOT exposed as an @mcp.tool() in production yet
-# (kept dormant/untested pending intentional rollout). suggest_best_slot_impl stays available
-# only via the token-gated /suggest route below. This keeps the live toolset at 14.
+@mcp.tool()
+def suggest_best_slot(service_id: str, date: str = "", days_ahead: int = 0,
+                      employee_id: str = "", window_start: str = "", window_end: str = "",
+                      specific_time: str = "") -> dict:
+    """THE availability tool. Call this ONCE, directly, for any availability/opening question -
+    no list_services / list_staff / check_availability setup needed.
+
+    Returns a gap-aware RECOMMENDATION and is recommendation-ONLY: it NEVER books, reschedules,
+    cancels, or changes anything in Meevo.
+    - 'recommended': the SINGLE best time to offer FIRST. Offer only this one and ask if it works.
+    - 'alternatives': up to 2 INTERNAL backups. Do NOT list these up front. Use one only if the
+      client declines the recommended time or explicitly asks for other options.
+    - 'status':
+        'ok'                         -> a time is available (see 'recommended').
+        'requested_time_unavailable' -> the exact time asked for is not open. 'alternatives'[0]
+                                        is the nearest time AFTER it, [1] the nearest BEFORE.
+                                        Say the asked time is unavailable and offer alternatives[0].
+        'no_availability'            -> nothing that day.
+    - 'handoff' is present ONLY on a genuine dead-end (no valid alternatives, or a scan error).
+      Offer the front desk THEN, and only then. If alternatives exist, do NOT hand off.
+
+    Args: service_id (the requested service). date = YYYY-MM-DD (defaults today). days_ahead
+    extends the search window. employee_id restricts to one provider (only when the client asked
+    for that person). window_start/window_end = 'HH:MM' time-of-day preference (e.g. afternoon).
+    specific_time = 'HH:MM' the client explicitly requested (honored exactly if open; otherwise
+    the nearest valid times are returned)."""
+    win = (window_start, window_end) if (window_start and window_end) else None
+    return suggest_best_slot_impl(service_id, date, days_ahead, employee_id, win,
+                                  specific_time or None)
 
 
 @mcp.custom_route("/suggest", methods=["GET"])
@@ -356,7 +384,7 @@ async def suggest_route(request):
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v40")
+    return PlainTextResponse("OK v41")
 
 
 @mcp.custom_route("/diag", methods=["GET"])

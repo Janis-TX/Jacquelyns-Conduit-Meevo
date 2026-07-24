@@ -48,6 +48,14 @@ def to_hhmm(mins: int) -> str:
     return f"{mins // 60:02d}:{mins % 60:02d}"
 
 
+def _safe_min(hhmm) -> Optional[int]:
+    """to_min that returns None on malformed input (never raises)."""
+    try:
+        return to_min(hhmm)
+    except Exception:
+        return None
+
+
 def reconstruct_free_intervals(reference_starts_min, ref_dur, grid=15):
     """From a REFERENCE-service scan (shortest service on the resource, duration `ref_dur`),
     reconstruct conservative free intervals. A contiguous run of grid-aligned starts
@@ -138,13 +146,41 @@ def suggest(service_duration, candidates_by_emp, reference_by_emp, ref_dur,
     if specific_time:
         st = to_min(specific_time)
         for emp, starts in candidates_by_emp.items():
-            if specific_time in starts:
+            if specific_time in (starts or []):
                 return {"status": "ok", "completeness": "exact_request",
                         "recommended": {"time": specific_time, "employee_id": emp,
                                         "reason_codes": ["CUSTOMER_REQUESTED"]},
                         "alternatives": []}
-        return {"status": "requested_time_unavailable", "completeness": "exact_request",
-                "recommended": None, "alternatives": []}
+        # Requested time NOT available. Return the nearest valid alternatives instead of
+        # bailing to the front desk: nearest AFTER the requested time = primary alternative,
+        # nearest BEFORE = secondary. Respects the caller-supplied provider scope
+        # (candidates_by_emp already filtered) and any time-of-day window. A front-desk
+        # handoff is reserved for the genuine dead-ends (no valid alternatives at all).
+        win = (to_min(requested_window[0]), to_min(requested_window[1])) if requested_window else None
+        cands = []  # (time_min, hhmm, emp)
+        for emp, starts in candidates_by_emp.items():
+            for t in (starts or []):
+                m = _safe_min(t)
+                if m is None:
+                    continue
+                if win and not (win[0] <= m <= win[1]):
+                    continue
+                cands.append((m, t, emp))
+        after = min((c for c in cands if c[0] > st), key=lambda c: c[0], default=None)
+        before = max((c for c in cands if c[0] < st), key=lambda c: c[0], default=None)
+        alts = []
+        if after:
+            alts.append({"time": after[1], "employee_id": after[2],
+                         "reason_codes": ["NEAREST_AFTER"]})
+        if before:
+            alts.append({"time": before[1], "employee_id": before[2],
+                         "reason_codes": ["NEAREST_BEFORE"]})
+        out = {"status": "requested_time_unavailable", "completeness": "exact_request",
+               "recommended": None, "alternatives": alts}
+        if not alts:
+            # no valid time on this date/provider/window -> let a human take it
+            out["handoff"] = "offer_front_desk"
+        return out
 
     # ---- no eligible availability -> safe handoff status (no crash on empty/malformed)
     total = sum(len(v or []) for v in candidates_by_emp.values())
@@ -153,11 +189,6 @@ def suggest(service_duration, candidates_by_emp, reference_by_emp, ref_dur,
                 "recommended": None, "alternatives": []}
 
     # earliest ranking for the tiebreak nudge (skip malformed entries defensively)
-    def _safe_min(t):
-        try:
-            return to_min(t)
-        except Exception:
-            return None
     all_starts = sorted({m for v in candidates_by_emp.values() for t in (v or [])
                          if (m := _safe_min(t)) is not None})
     rank = {m: i for i, m in enumerate(all_starts)}
@@ -281,6 +312,63 @@ def _run_tests():
     r_facial = suggest(50, {"A": ["09:00"]}, {"A": ["09:00"]}, ref_dur=25)
     ok("completeness booth=complete", r_booth["completeness"] == "complete")
     ok("completeness facial=approx", r_facial["completeness"] == "approx_trailing_edge")
+
+    # ---- exact-time-unavailable path: nearest-alternative behaviour (Tier-3 refinement) ----
+
+    # 12) requested time BEFORE opening -> nearest AFTER is primary alt, no handoff
+    r = suggest(15, {"A": ["09:00", "09:15", "10:00"]}, {"A": ["09:00"]}, ref_dur=15,
+                specific_time="07:00")
+    ok("before-open -> nearest after", r["status"] == "requested_time_unavailable"
+       and r["recommended"] is None
+       and r["alternatives"][0]["time"] == "09:00"
+       and "NEAREST_AFTER" in r["alternatives"][0]["reason_codes"]
+       and "handoff" not in r)
+
+    # 13) requested time AFTER closing -> only a BEFORE alt exists (still no handoff)
+    r = suggest(15, {"A": ["15:00", "16:30"]}, {"A": ["15:00"]}, ref_dur=15,
+                specific_time="20:00")
+    ok("after-close -> nearest before", r["status"] == "requested_time_unavailable"
+       and r["alternatives"][0]["time"] == "16:30"
+       and "NEAREST_BEFORE" in r["alternatives"][0]["reason_codes"]
+       and "handoff" not in r)
+
+    # 14) unavailable time with a LATER alternative only
+    r = suggest(15, {"A": ["10:00", "11:00"]}, {"A": ["10:00"]}, ref_dur=15,
+                specific_time="09:30")
+    ok("unavailable -> later alt", r["alternatives"][0]["time"] == "10:00"
+       and "NEAREST_AFTER" in r["alternatives"][0]["reason_codes"])
+
+    # 15) unavailable with EARLIER and LATER -> after=primary, before=secondary
+    r = suggest(15, {"A": ["09:00", "12:00"]}, {"A": ["09:00"]}, ref_dur=15,
+                specific_time="10:30")
+    ok("unavailable -> after primary + before secondary",
+       r["alternatives"][0]["time"] == "12:00"
+       and "NEAREST_AFTER" in r["alternatives"][0]["reason_codes"]
+       and r["alternatives"][1]["time"] == "09:00"
+       and "NEAREST_BEFORE" in r["alternatives"][1]["reason_codes"])
+
+    # 16) unavailable with NO valid alternatives -> front-desk handoff
+    r = suggest(15, {"A": []}, {"A": []}, ref_dur=15, specific_time="10:00")
+    ok("unavailable + no alts -> handoff", r["status"] == "requested_time_unavailable"
+       and r["alternatives"] == [] and r.get("handoff") == "offer_front_desk")
+
+    # 17) provider-specific requested time unavailable -> alts stay on that provider
+    r = suggest(15, {"B": ["11:00", "13:00"]}, {"B": ["11:00"]}, ref_dur=15,
+                specific_time="12:00")
+    ok("provider-specific unavailable keeps provider",
+       all(a["employee_id"] == "B" for a in r["alternatives"])
+       and r["alternatives"][0]["time"] == "13:00")
+
+    # 18) exact requested time VALID -> honored, no alternatives surfaced
+    r = suggest(15, {"A": ["14:30"]}, {"A": ["14:30"]}, ref_dur=15, specific_time="14:30")
+    ok("exact valid honored", r["status"] == "ok"
+       and r["recommended"]["time"] == "14:30" and r["alternatives"] == [])
+
+    # 18b) time-of-day window is respected when picking alternatives
+    r = suggest(15, {"A": ["09:00", "13:00", "15:00"]}, {"A": ["09:00"]}, ref_dur=15,
+                specific_time="16:00", requested_window=("12:00", "17:00"))
+    ok("window respected on alts", r["alternatives"][0]["time"] == "15:00"
+       and all(_safe_min(a["time"]) >= to_min("12:00") for a in r["alternatives"]))
 
     print(f"\nALL {passed} ASSERTIONS PASSED")
 
