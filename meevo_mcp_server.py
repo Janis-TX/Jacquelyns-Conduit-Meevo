@@ -35,6 +35,7 @@ import requests
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from mcp.server.fastmcp import FastMCP
+import rec_cache as RC  # server-backed store for the decline-turn get_next_recommended_slot flow
 
 # ---- config (NO secrets hardcoded; all from env) --------------------------
 APP_ID = os.environ.get("MEEVO_APP_ID", "")
@@ -291,6 +292,25 @@ def _scan_raw(service_id, start, end, employee=""):
                             "res": o.get("resourceName") or o.get("ResourceName") or ""})
     return out, r.status_code
 
+def _revalidate_slot(service_id, date_str, hhmm, employee=""):
+    """Lightweight single-scan check that an EXACT time is still open for a service
+    (optionally for a specific provider). No scoring, no service/employee listing, no KB —
+    used ONLY by get_next_recommended_slot to confirm a cached alternative is still bookable.
+    Returns True/False."""
+    if not (service_id and date_str and hhmm):
+        return False
+    try:
+        rr, _status = _scan_raw(service_id, date_str, date_str, employee or "")
+    except Exception:
+        return False
+    for o in (rr or []):
+        if o.get("s") == hhmm:
+            if employee and o.get("emp_id") and o.get("emp_id") != employee:
+                continue
+            return True
+    return False
+
+
 def suggest_best_slot_impl(service_id, date_str="", days=0, employee="", window=None, specific=None):
     """DORMANT consolidated availability + recommendation. RECOMMENDATION ONLY — never books.
     One call: resolve service (cache) -> candidate scan -> eligible providers -> per-provider
@@ -328,6 +348,23 @@ def suggest_best_slot_impl(service_id, date_str="", days=0, employee="", window=
     # (requested_time_unavailable WITH nearest-time alternatives must NOT be forced to a handoff.)
     if out.get("status") != "ok" and not out.get("alternatives") and not out.get("handoff"):
         out["handoff"] = "offer_front_desk"
+
+    # Cache the NOT-yet-offered alternatives so the decline turn can be served by the
+    # lightweight get_next_recommended_slot tool instead of re-running the whole optimizer.
+    #   ok                         -> recommended is offered now; cache all alternatives.
+    #   requested_time_unavailable -> alternatives[0] is offered now; cache the rest.
+    st = out.get("status")
+    if st == "ok":
+        remaining = out.get("alternatives") or []
+    elif st == "requested_time_unavailable":
+        remaining = (out.get("alternatives") or [])[1:]
+    else:
+        remaining = None
+    if remaining is not None:
+        rid, exp = RC.put(service_id, start, employee, window, remaining)
+        out["recommendation_id"] = rid
+        out["expires_at"] = round(exp, 1)
+        out["expires_in_sec"] = RC.TTL_SECONDS
     return out
 
 
@@ -352,6 +389,10 @@ def suggest_best_slot(service_id: str, date: str = "", days_ahead: int = 0,
     - 'handoff' is present ONLY on a genuine dead-end (no valid alternatives, or a scan error).
       Offer the front desk THEN, and only then. If alternatives exist, do NOT hand off.
 
+    - 'recommendation_id': SAVE this. If the client DECLINES the offered time (or asks for
+      another option), call get_next_recommended_slot(recommendation_id) — do NOT call this
+      tool again and do NOT re-run the availability workflow.
+
     Args: service_id (the requested service). date = YYYY-MM-DD (defaults today). days_ahead
     extends the search window. employee_id restricts to one provider (only when the client asked
     for that person). window_start/window_end = 'HH:MM' time-of-day preference (e.g. afternoon).
@@ -360,6 +401,31 @@ def suggest_best_slot(service_id: str, date: str = "", days_ahead: int = 0,
     win = (window_start, window_end) if (window_start and window_end) else None
     return suggest_best_slot_impl(service_id, date, days_ahead, employee_id, win,
                                   specific_time or None)
+
+
+def get_next_recommended_slot_impl(recommendation_id):
+    t0 = _now_ms()
+    res = RC.get_next(recommendation_id, revalidate_fn=_revalidate_slot)
+    res["timing_ms"] = round(_now_ms() - t0, 1)
+    return res
+
+
+@mcp.tool()
+def get_next_recommended_slot(recommendation_id: str) -> dict:
+    """Return the NEXT best opening after the client declined the previously suggested time.
+    RECOMMENDATION ONLY — never books, reschedules, or cancels anything.
+
+    This is LIGHTWEIGHT and is the tool to use ON A DECLINE: it reads the alternatives that
+    suggest_best_slot already cached and revalidates just that one time against Meevo. It does
+    NOT run list_services / list_staff, provider scans, scoring, or any knowledge search — so it
+    will not blow the turn budget the way re-running the full availability flow does.
+
+    Pass the recommendation_id returned by suggest_best_slot. Returns:
+    - status 'ok'                   -> 'recommended' is the next time; offer only this one.
+    - 'no_more_alternatives'        -> nothing left to offer; ask what else works.
+    - 'recommendation_expired' / 'cache_miss' -> the saved set is gone; call suggest_best_slot
+      again to get a fresh recommendation (and a new recommendation_id)."""
+    return get_next_recommended_slot_impl(recommendation_id)
 
 
 @mcp.custom_route("/suggest", methods=["GET"])
@@ -384,7 +450,7 @@ async def suggest_route(request):
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v41")
+    return PlainTextResponse("OK v42")
 
 
 @mcp.custom_route("/diag", methods=["GET"])
