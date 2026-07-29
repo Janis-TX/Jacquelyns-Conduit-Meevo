@@ -36,6 +36,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from mcp.server.fastmcp import FastMCP
 import rec_cache as RC  # server-backed store for the decline-turn get_next_recommended_slot flow
+import date_labels as DL  # authoritative today/tomorrow labeling so the agent never guesses the day
 
 # ---- config (NO secrets hardcoded; all from env) --------------------------
 APP_ID = os.environ.get("MEEVO_APP_ID", "")
@@ -368,7 +369,8 @@ def suggest_best_slot_impl(service_id, date_str="", days=0, employee="", window=
     return out
 
 
-@mcp.tool()
+# @mcp.tool()  # DORMANT in v43 (date-fix release): keep the 14-tool production set unchanged;
+#              re-enable together with get_next_recommended_slot once Conduit's per-turn budget is fixed.
 def suggest_best_slot(service_id: str, date: str = "", days_ahead: int = 0,
                       employee_id: str = "", window_start: str = "", window_end: str = "",
                       specific_time: str = "") -> dict:
@@ -410,7 +412,7 @@ def get_next_recommended_slot_impl(recommendation_id):
     return res
 
 
-@mcp.tool()
+# @mcp.tool()  # DORMANT in v43 (date-fix release); re-enable with suggest_best_slot when Conduit budget is fixed.
 def get_next_recommended_slot(recommendation_id: str) -> dict:
     """Return the NEXT best opening after the client declined the previously suggested time.
     RECOMMENDATION ONLY — never books, reschedules, or cancels anything.
@@ -450,7 +452,7 @@ async def suggest_route(request):
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v42")
+    return PlainTextResponse("OK v43")
 
 
 @mcp.custom_route("/diag", methods=["GET"])
@@ -731,6 +733,25 @@ def _enrich_names(appts):
     return appts
 
 
+def _with_current_date(resp):
+    """Attach an authoritative current date (spa local time) and, for any appointments in
+    the response, a per-appointment absolute date + relative label ('today (Tuesday, Jul 28)').
+    This stops the agent from echoing a stale 'today/tomorrow' from an earlier message: it
+    reads the label off the real appointment date instead."""
+    today = _today()
+    resp["current_date"] = today.isoformat()
+    resp["current_date_label"] = DL.pretty(today)   # e.g. 'Tuesday, Jul 28'
+    for a in (resp.get("appointments") or []):
+        st = a.get("start_time")
+        if st:
+            try:
+                a["date"] = str(st)[:10]
+                a["date_label"] = DL.date_label(st, today)   # e.g. 'today (Tuesday, Jul 28)'
+            except Exception:
+                pass
+    return resp
+
+
 def _appts_api_fallback(client_id, sd, ed):
     tried = {}
     for path, params in [
@@ -789,7 +810,13 @@ def _appts_sftp_fallback(client_id, sd, ed):
 def get_client_appointments(client_id: str, start_date: str = "", end_date: str = "") -> dict:
     """Get a client's upcoming appointments. Returns appointment_service_id and
     concurrency_check_digits needed for cancel/reschedule. Dates: YYYY-MM-DD
-    (defaults today .. +90 days)."""
+    (defaults today .. +90 days).
+
+    Each appointment includes 'date' (YYYY-MM-DD) and 'date_label' (e.g.
+    'today (Tuesday, Jul 28)'), and the response includes 'current_date'. When telling a
+    client their appointment day, ALWAYS use 'date_label' from the appointment you looked
+    up — never repeat 'today'/'tomorrow' from an earlier message, since that word may be
+    stale (a confirmation sent last night said 'tomorrow' but by this morning it is 'today')."""
     sd = start_date or _today().isoformat()
     ed = end_date or (_today() + timedelta(days=90)).isoformat()
     tried = {}
@@ -800,8 +827,8 @@ def get_client_appointments(client_id: str, start_date: str = "", end_date: str 
         tried["book/client/{id}/services"] = f"ok ({len(parsed)})" if parsed else "empty"
         if parsed:
             _enrich_names(parsed)
-            return {"appointments": parsed, "count": len(parsed), "date_range": f"{sd} to {ed}",
-                    "source": "book/client/services"}
+            return _with_current_date({"appointments": parsed, "count": len(parsed),
+                    "date_range": f"{sd} to {ed}", "source": "book/client/services"})
     except requests.HTTPError as e:
         tried["book/client/{id}/services"] = f"{e.response.status_code}" if e.response else "err"
     # FALLBACK: other public api paths
@@ -809,12 +836,12 @@ def get_client_appointments(client_id: str, start_date: str = "", end_date: str 
     tried.update(api_tried)
     if parsed:
         _enrich_names(parsed)
-        return {"appointments": parsed, "count": len(parsed), "date_range": f"{sd} to {ed}",
-                "source": "api-fallback"}
+        return _with_current_date({"appointments": parsed, "count": len(parsed),
+                "date_range": f"{sd} to {ed}", "source": "api-fallback"})
     # LAST RESORT: SFTP/DDS feed
     sftp_res = _appts_sftp_fallback(client_id, sd, ed)
     sftp_res.update({"date_range": f"{sd} to {ed}", "source": "sftp", "tried": tried})
-    return sftp_res
+    return _with_current_date(sftp_res)
 
 
 def _scan_body(service_id, start, end, employee_id, scan_date_type, scan_time_type):
@@ -890,6 +917,7 @@ def check_availability(service_id: str, check_date: str = "", days_ahead: int = 
         openings = _parse_groups(r.json())
         if openings:
             return {"service_id": service_id, "start": start, "end": end,
+                    "current_date": _today().isoformat(),
                     "openings": _compact_openings(openings), "total": len(openings), "source": "ob"}
         ob_note = "ob scan returned 0 openings"
     except requests.HTTPError as e:
@@ -905,6 +933,7 @@ def check_availability(service_id: str, check_date: str = "", days_ahead: int = 
                                       **({"EmployeeIds": [employee_id]} if employee_id else {})}]}
         data = meevo_post("/publicapi/v2/scan/openings", pub_body)
         return {"service_id": service_id, "start": start, "end": end, "source": "publicapi-scan",
+                "current_date": _today().isoformat(),
                 "note": ob_note, "raw": str(data)[:3000]}
     except requests.HTTPError as e:
         return {"error": f"both scan paths failed", "ob": ob_note,
