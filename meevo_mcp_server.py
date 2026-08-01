@@ -452,7 +452,7 @@ async def suggest_route(request):
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
     from starlette.responses import PlainTextResponse
-    return PlainTextResponse("OK v43")
+    return PlainTextResponse("OK v44")
 
 
 @mcp.custom_route("/diag", methods=["GET"])
@@ -879,14 +879,75 @@ def _compact_openings(openings, per_day=3, cap=6):
     return out
 
 
+def _hhmm_to_min(hhmm):
+    """'13:30' -> 810 minutes; tolerant of bad input (returns None)."""
+    try:
+        h, m = str(hhmm).split(":")[:2]
+        return int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+
+def _to_min_loose(t):
+    """Parse a requested time in many shapes -> minutes since midnight, or None.
+    Accepts '13:30', '1:30 PM', '1:30pm', '1 pm', '1:30'."""
+    if not t:
+        return None
+    s = str(t).strip().lower().replace(".", "")
+    ampm = None
+    if s.endswith("am") or s.endswith("pm"):
+        ampm, s = s[-2:], s[:-2].strip()
+    if ":" in s:
+        hh, mm = s.split(":", 1)
+    else:
+        hh, mm = s, "0"
+    try:
+        h, m = int(hh), int(mm)
+    except ValueError:
+        return None
+    if ampm == "pm" and h != 12:
+        h += 12
+    if ampm == "am" and h == 12:
+        h = 0
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return None
+    return h * 60 + m
+
+
+def _openings_around(openings, around, day="", cap=6):
+    """Order openings by nearness to the requested time `around` so the exact
+    requested slot (if open) comes first and real later-in-the-day times surface,
+    instead of only the soonest few. Prefers the requested day; falls back to the
+    whole window. Ties break toward times at/after the request."""
+    target = _to_min_loose(around)
+    if target is None:
+        return _compact_openings(openings)
+    same_day = [o for o in openings if (not day or o.get("date", "") == day)]
+    pool = same_day or openings
+
+    def _key(o):
+        st = _hhmm_to_min(o.get("start_time", ""))
+        if st is None:
+            return (10 ** 6, 1, 0)
+        return (abs(st - target), 0 if st >= target else 1, st)
+
+    return sorted(pool, key=_key)[:cap]
+
+
 @mcp.tool()
 def check_availability(service_id: str, check_date: str = "", days_ahead: int = 7,
-                       employee_id: str = "") -> dict:
+                       employee_id: str = "", around_time: str = "") -> dict:
     """Check open appointment slots for a service. This is THE tool for availability/openings -
     call it once, directly; no setup needed. service_id comes from list_services. check_date is
-    YYYY-MM-DD (defaults today). Returns the SOONEST openings already sorted earliest-first
-    (a few per day) so you can offer the nearest times; 'total' is the full count if more exist.
-    One call covers the whole window - do NOT call this repeatedly day-by-day."""
+    YYYY-MM-DD (defaults today).
+    around_time = the time the guest asked for ('HH:MM' 24h, e.g. '13:30'; '1:30 PM' also works).
+    ALWAYS pass it when the guest names or implies a time ('around 1:30', 'this afternoon' ->
+    '15:00'). With around_time the tool returns the openings NEAREST that time - the exact slot
+    first if it is open - across all eligible providers, and sets 'exact_available'. WITHOUT
+    around_time it returns only the SOONEST openings, so a guest asking for a later time would
+    not see it. To check a different time, call once more with the new around_time.
+    'total' is the full count if more exist. One call covers the whole window - do NOT call it
+    repeatedly day-by-day."""
     scan_date_type = 2094   # working defaults for this location (do not require the agent to set)
     scan_time_type = 2095
     start = check_date or _today().isoformat()
@@ -916,9 +977,19 @@ def check_availability(service_id: str, check_date: str = "", days_ahead: int = 
         r.raise_for_status()
         openings = _parse_groups(r.json())
         if openings:
+            if around_time:
+                selected = _openings_around(openings, around_time, start)
+                _tgt = _to_min_loose(around_time)
+                exact = (any(o.get("date", "") == start
+                             and _hhmm_to_min(o.get("start_time", "")) == _tgt
+                             for o in openings) if _tgt is not None else None)
+            else:
+                selected = _compact_openings(openings)
+                exact = None
             return {"service_id": service_id, "start": start, "end": end,
                     "current_date": _today().isoformat(),
-                    "openings": _compact_openings(openings), "total": len(openings), "source": "ob"}
+                    "requested_time": around_time or None, "exact_available": exact,
+                    "openings": selected, "total": len(openings), "source": "ob"}
         ob_note = "ob scan returned 0 openings"
     except requests.HTTPError as e:
         ob_note = f"ob scan error: {e.response.text[:200] if e.response is not None else e}"
